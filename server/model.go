@@ -7,32 +7,35 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/convert"
 	"github.com/ollama/ollama/llm"
+	"github.com/ollama/ollama/templates"
 	"github.com/ollama/ollama/types/model"
 )
 
-type layerWithGGML struct {
+var intermediateBlobs map[string]string = make(map[string]string)
+
+type layerGGML struct {
 	*Layer
 	*llm.GGML
 }
 
-func parseFromModel(ctx context.Context, name model.Name, fn func(api.ProgressResponse)) (layers []*layerWithGGML, err error) {
-	modelpath := ParseModelPath(name.String())
-	manifest, _, err := GetManifest(modelpath)
+func parseFromModel(ctx context.Context, name model.Name, fn func(api.ProgressResponse)) (layers []*layerGGML, err error) {
+	m, err := ParseNamedManifest(name)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		if err := PullModel(ctx, name.String(), &registryOptions{}, fn); err != nil {
 			return nil, err
 		}
 
-		modelpath = ParseModelPath(name.String())
-		manifest, _, err = GetManifest(modelpath)
+		m, err = ParseNamedManifest(name)
 		if err != nil {
 			return nil, err
 		}
@@ -40,8 +43,8 @@ func parseFromModel(ctx context.Context, name model.Name, fn func(api.ProgressRe
 		return nil, err
 	}
 
-	for _, layer := range manifest.Layers {
-		layer, err := NewLayerFromLayer(layer.Digest, layer.MediaType, modelpath.GetShortTagname())
+	for _, layer := range m.Layers {
+		layer, err := NewLayerFromLayer(layer.Digest, layer.MediaType, name.DisplayShortest())
 		if err != nil {
 			return nil, err
 		}
@@ -61,77 +64,94 @@ func parseFromModel(ctx context.Context, name model.Name, fn func(api.ProgressRe
 			}
 			defer blob.Close()
 
-			ggml, _, err := llm.DecodeGGML(blob)
+			ggml, _, err := llm.DecodeGGML(blob, 0)
 			if err != nil {
 				return nil, err
 			}
 
-			layers = append(layers, &layerWithGGML{layer, ggml})
+			layers = append(layers, &layerGGML{layer, ggml})
 		default:
-			layers = append(layers, &layerWithGGML{layer, nil})
+			layers = append(layers, &layerGGML{layer, nil})
 		}
-
 	}
 
 	return layers, nil
 }
 
-func parseFromZipFile(_ context.Context, file *os.File, fn func(api.ProgressResponse)) (layers []*layerWithGGML, err error) {
+func extractFromZipFile(p string, file *os.File, fn func(api.ProgressResponse)) error {
 	stat, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	r, err := zip.NewReader(file, stat.Size())
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	tempdir, err := os.MkdirTemp(filepath.Dir(file.Name()), "")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(tempdir)
 
 	fn(api.ProgressResponse{Status: "unpacking model metadata"})
 	for _, f := range r.File {
+		n := filepath.Join(p, f.Name)
+		if !strings.HasPrefix(n, p) {
+			slog.Warn("skipped extracting file outside of context", "name", f.Name)
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(n), 0o750); err != nil {
+			return err
+		}
+
 		// TODO(mxyng): this should not write out all files to disk
-		outfile, err := os.Create(filepath.Join(tempdir, f.Name))
+		outfile, err := os.Create(n)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer outfile.Close()
 
 		infile, err := f.Open()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer infile.Close()
 
 		if _, err = io.Copy(outfile, infile); err != nil {
-			return nil, err
+			return err
 		}
 
 		if err := outfile.Close(); err != nil {
-			return nil, err
+			return err
 		}
 
 		if err := infile.Close(); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	mf, err := convert.GetModelFormat(tempdir)
+	return nil
+}
+
+func parseFromZipFile(_ context.Context, file *os.File, digest string, fn func(api.ProgressResponse)) (layers []*layerGGML, err error) {
+	tempDir, err := os.MkdirTemp(filepath.Dir(file.Name()), "")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := extractFromZipFile(tempDir, file, fn); err != nil {
+		return nil, err
+	}
+
+	mf, err := convert.GetModelFormat(tempDir)
 	if err != nil {
 		return nil, err
 	}
 
-	params, err := mf.GetParams(tempdir)
+	params, err := mf.GetParams(tempDir)
 	if err != nil {
 		return nil, err
 	}
 
-	mArch, err := mf.GetModelArch("", tempdir, params)
+	mArch, err := mf.GetModelArch("", tempDir, params)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +169,7 @@ func parseFromZipFile(_ context.Context, file *os.File, fn func(api.ProgressResp
 
 	// TODO(mxyng): this should write directly into a layer
 	// e.g. NewLayer(arch.Reader(), "application/vnd.ollama.image.model")
-	temp, err := os.CreateTemp(tempdir, "fp16")
+	temp, err := os.CreateTemp(tempDir, "fp16")
 	if err != nil {
 		return nil, err
 	}
@@ -166,35 +186,27 @@ func parseFromZipFile(_ context.Context, file *os.File, fn func(api.ProgressResp
 
 	layer, err := NewLayer(temp, "application/vnd.ollama.image.model")
 	if err != nil {
-		return nil, fmt.Errorf("aaa: %w", err)
-	}
-
-	blobpath, err := GetBlobsPath(layer.Digest)
-	if err != nil {
 		return nil, err
 	}
 
-	bin, err := os.Open(blobpath)
+	bin, err := layer.Open()
 	if err != nil {
 		return nil, err
 	}
 	defer bin.Close()
 
-	ggml, _, err := llm.DecodeGGML(bin)
+	ggml, _, err := llm.DecodeGGML(bin, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	layer, err = NewLayerFromLayer(layer.Digest, layer.MediaType, "")
-	if err != nil {
-		return nil, err
-	}
+	layers = append(layers, &layerGGML{layer, ggml})
 
-	layers = append(layers, &layerWithGGML{layer, ggml})
-	return layers, nil
+	intermediateBlobs[digest] = layer.Digest
+	return detectChatTemplate(layers)
 }
 
-func parseFromFile(ctx context.Context, file *os.File, fn func(api.ProgressResponse)) (layers []*layerWithGGML, err error) {
+func parseFromFile(ctx context.Context, file *os.File, digest string, fn func(api.ProgressResponse)) (layers []*layerGGML, err error) {
 	sr := io.NewSectionReader(file, 0, 512)
 	contentType, err := detectContentType(sr)
 	if err != nil {
@@ -205,7 +217,7 @@ func parseFromFile(ctx context.Context, file *os.File, fn func(api.ProgressRespo
 	case "gguf", "ggla":
 		// noop
 	case "application/zip":
-		return parseFromZipFile(ctx, file, fn)
+		return parseFromZipFile(ctx, file, digest, fn)
 	default:
 		return nil, fmt.Errorf("unsupported content type: %s", contentType)
 	}
@@ -217,7 +229,7 @@ func parseFromFile(ctx context.Context, file *os.File, fn func(api.ProgressRespo
 
 	var offset int64
 	for offset < stat.Size() {
-		ggml, n, err := llm.DecodeGGML(file)
+		ggml, n, err := llm.DecodeGGML(file, 0)
 		if errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {
@@ -236,8 +248,28 @@ func parseFromFile(ctx context.Context, file *os.File, fn func(api.ProgressRespo
 			return nil, err
 		}
 
-		layers = append(layers, &layerWithGGML{layer, ggml})
+		layers = append(layers, &layerGGML{layer, ggml})
 		offset = n
+	}
+
+	return detectChatTemplate(layers)
+}
+
+func detectChatTemplate(layers []*layerGGML) ([]*layerGGML, error) {
+	for _, layer := range layers {
+		if s := layer.GGML.KV().ChatTemplate(); s != "" {
+			if t, err := templates.NamedTemplate(s); err != nil {
+				slog.Debug("template detection", "error", err)
+			} else {
+				tmpl, err := NewLayer(t.Reader(), "application/vnd.ollama.image.template")
+				if err != nil {
+					return nil, err
+				}
+
+				tmpl.status = fmt.Sprintf("using autodetected template %s", t.Name)
+				layers = append(layers, &layerGGML{tmpl, nil})
+			}
+		}
 	}
 
 	return layers, nil

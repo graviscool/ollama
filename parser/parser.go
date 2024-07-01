@@ -1,4 +1,4 @@
-package model
+package parser
 
 import (
 	"bufio"
@@ -8,6 +8,9 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 )
 
 type File struct {
@@ -70,7 +73,9 @@ func ParseFile(r io.Reader) (*File, error) {
 
 	var f File
 
-	br := bufio.NewReader(r)
+	tr := unicode.BOMOverride(unicode.UTF8.NewDecoder())
+	br := bufio.NewReader(transform.NewReader(r, tr))
+
 	for {
 		r, _, err := br.ReadRune()
 		if errors.Is(err, io.EOF) {
@@ -119,7 +124,7 @@ func ParseFile(r io.Reader) (*File, error) {
 			case stateComment, stateNil:
 				// pass
 			case stateValue:
-				s, ok := unquote(b.String())
+				s, ok := unquote(strings.TrimSpace(b.String()))
 				if !ok || isSpace(r) {
 					if _, err := b.WriteRune(r); err != nil {
 						return nil, err
@@ -153,7 +158,7 @@ func ParseFile(r io.Reader) (*File, error) {
 	case stateComment, stateNil:
 		// pass; nothing to flush
 	case stateValue:
-		s, ok := unquote(b.String())
+		s, ok := unquote(strings.TrimSpace(b.String()))
 		if !ok {
 			return nil, io.ErrUnexpectedEOF
 		}
