@@ -70,7 +70,7 @@ type Model struct {
 	License        []string
 	Digest         string
 	Options        map[string]interface{}
-	Messages       []Message
+	Messages       []api.Message
 
 	Template *template.Template
 }
@@ -184,16 +184,11 @@ func (m *Model) String() string {
 	for _, msg := range m.Messages {
 		modelfile.Commands = append(modelfile.Commands, parser.Command{
 			Name: "message",
-			Args: fmt.Sprintf("%s %s", msg.Role, msg.Content),
+			Args: fmt.Sprintf("%s: %s", msg.Role, msg.Content),
 		})
 	}
 
 	return modelfile.String()
-}
-
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
 }
 
 type ConfigV2 struct {
@@ -255,19 +250,21 @@ func GetModel(name string) (*Model, error) {
 		Template:  template.DefaultTemplate,
 	}
 
-	filename, err := GetBlobsPath(manifest.Config.Digest)
-	if err != nil {
-		return nil, err
-	}
+	if manifest.Config.Digest != "" {
+		filename, err := GetBlobsPath(manifest.Config.Digest)
+		if err != nil {
+			return nil, err
+		}
 
-	configFile, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer configFile.Close()
+		configFile, err := os.Open(filename)
+		if err != nil {
+			return nil, err
+		}
+		defer configFile.Close()
 
-	if err := json.NewDecoder(configFile).Decode(&model.Config); err != nil {
-		return nil, err
+		if err := json.NewDecoder(configFile).Decode(&model.Config); err != nil {
+			return nil, err
+		}
 	}
 
 	for _, layer := range manifest.Layers {
@@ -376,7 +373,7 @@ func CreateModel(ctx context.Context, name model.Name, modelFileDir, quantizatio
 	var messages []*api.Message
 	parameters := make(map[string]any)
 
-	var layers []*Layer
+	var layers []Layer
 	for _, c := range modelfile.Commands {
 		mediatype := fmt.Sprintf("application/vnd.ollama.image.%s", c.Name)
 
@@ -502,7 +499,7 @@ func CreateModel(ctx context.Context, name model.Name, modelFileDir, quantizatio
 
 			if c.Name != "license" {
 				// replace
-				layers = slices.DeleteFunc(layers, func(layer *Layer) bool {
+				layers = slices.DeleteFunc(layers, func(layer Layer) bool {
 					if layer.MediaType != mediatype {
 						return false
 					}
@@ -548,7 +545,7 @@ func CreateModel(ctx context.Context, name model.Name, modelFileDir, quantizatio
 	}
 
 	var err2 error
-	layers = slices.DeleteFunc(layers, func(layer *Layer) bool {
+	layers = slices.DeleteFunc(layers, func(layer Layer) bool {
 		switch layer.MediaType {
 		case "application/vnd.ollama.image.message":
 			// if there are new messages, remove the inherited ones
@@ -628,12 +625,12 @@ func CreateModel(ctx context.Context, name model.Name, modelFileDir, quantizatio
 		return err
 	}
 
-	layer, err := NewLayer(&b, "application/vnd.docker.container.image.v1+json")
+	configLayer, err := NewLayer(&b, "application/vnd.docker.container.image.v1+json")
 	if err != nil {
 		return err
 	}
 
-	for _, layer := range append(layers, layer) {
+	for _, layer := range append(layers, configLayer) {
 		if layer.status != "" {
 			fn(api.ProgressResponse{Status: layer.status})
 		}
@@ -642,11 +639,11 @@ func CreateModel(ctx context.Context, name model.Name, modelFileDir, quantizatio
 	old, _ := ParseNamedManifest(name)
 
 	fn(api.ProgressResponse{Status: "writing manifest"})
-	if err := WriteManifest(name, layer, layers); err != nil {
+	if err := WriteManifest(name, configLayer, layers); err != nil {
 		return err
 	}
 
-	if !envconfig.NoPrune && old != nil {
+	if !envconfig.NoPrune() && old != nil {
 		if err := old.RemoveLayers(); err != nil {
 			return err
 		}
@@ -719,8 +716,7 @@ func deleteUnusedLayers(skipModelPath *ModelPath, deleteMap map[string]struct{})
 		// save (i.e. delete from the deleteMap) any files used in other manifests
 		manifest, _, err := GetManifest(fmp)
 		if err != nil {
-			//nolint:nilerr
-			return nil
+			return err
 		}
 
 		for _, layer := range manifest.Layers {
@@ -787,7 +783,8 @@ func PruneLayers() error {
 
 	err = deleteUnusedLayers(nil, deleteMap)
 	if err != nil {
-		return err
+		slog.Error(fmt.Sprintf("couldn't remove unused layers: %v", err))
+		return nil
 	}
 
 	slog.Info(fmt.Sprintf("total unused blobs removed: %d", len(deleteMap)))
@@ -833,7 +830,7 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 	fn(api.ProgressResponse{Status: "retrieving manifest"})
 
 	if mp.ProtocolScheme == "http" && !regOpts.Insecure {
-		return fmt.Errorf("insecure protocol http")
+		return errors.New("insecure protocol http")
 	}
 
 	manifest, _, err := GetManifest(mp)
@@ -842,9 +839,11 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		return err
 	}
 
-	var layers []*Layer
+	var layers []Layer
 	layers = append(layers, manifest.Layers...)
-	layers = append(layers, manifest.Config)
+	if manifest.Config.Digest != "" {
+		layers = append(layers, manifest.Config)
+	}
 
 	for _, layer := range layers {
 		if err := uploadBlob(ctx, mp, layer, regOpts, fn); err != nil {
@@ -885,7 +884,7 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 	// build deleteMap to prune unused layers
 	deleteMap := make(map[string]struct{})
 
-	if !envconfig.NoPrune {
+	if !envconfig.NoPrune() {
 		manifest, _, err = GetManifest(mp)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -895,12 +894,14 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 			for _, l := range manifest.Layers {
 				deleteMap[l.Digest] = struct{}{}
 			}
-			deleteMap[manifest.Config.Digest] = struct{}{}
+			if manifest.Config.Digest != "" {
+				deleteMap[manifest.Config.Digest] = struct{}{}
+			}
 		}
 	}
 
 	if mp.ProtocolScheme == "http" && !regOpts.Insecure {
-		return fmt.Errorf("insecure protocol http")
+		return errors.New("insecure protocol http")
 	}
 
 	fn(api.ProgressResponse{Status: "pulling manifest"})
@@ -910,9 +911,11 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		return fmt.Errorf("pull model manifest: %s", err)
 	}
 
-	var layers []*Layer
+	var layers []Layer
 	layers = append(layers, manifest.Layers...)
-	layers = append(layers, manifest.Config)
+	if manifest.Config.Digest != "" {
+		layers = append(layers, manifest.Config)
+	}
 
 	skipVerify := make(map[string]bool)
 	for _, layer := range layers {
@@ -976,7 +979,8 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		fn(api.ProgressResponse{Status: "removing any unused layers"})
 		err = deleteUnusedLayers(nil, deleteMap)
 		if err != nil {
-			return err
+			slog.Error(fmt.Sprintf("couldn't remove unused layers: %v", err))
+			fn(api.ProgressResponse{Status: fmt.Sprintf("couldn't remove unused layers: %v", err)})
 		}
 	}
 
@@ -1015,7 +1019,7 @@ func GetSHA256Digest(r io.Reader) (string, int64) {
 	return fmt.Sprintf("sha256:%x", h.Sum(nil)), n
 }
 
-var errUnauthorized = fmt.Errorf("unauthorized: access denied")
+var errUnauthorized = errors.New("unauthorized: access denied")
 
 // getTokenSubject returns the subject of a JWT token, it does not validate the token
 func getTokenSubject(token string) string {

@@ -54,6 +54,7 @@ Here are some example models that can be downloaded:
 | Llama 3.1          | 405B       | 231GB | `ollama run llama3.1:405b`     |
 | Phi 3 Mini         | 3.8B       | 2.3GB | `ollama run phi3`              |
 | Phi 3 Medium       | 14B        | 7.9GB | `ollama run phi3:medium`       |
+| Gemma 2            | 2B         | 1.6GB | `ollama run gemma2:2b`         |
 | Gemma 2            | 9B         | 5.5GB | `ollama run gemma2`            |
 | Gemma 2            | 27B        | 16GB  | `ollama run gemma2:27b`        |
 | Mistral            | 7B         | 4.1GB | `ollama run mistral`           |
@@ -173,7 +174,7 @@ I'm a basic program that prints the famous "Hello, world!" message to the consol
 ### Multimodal models
 
 ```
->>> What's in this image? /Users/jmorgan/Desktop/smile.png
+ollama run llava "What's in this image? /Users/jmorgan/Desktop/smile.png"
 The image features a yellow smiley face, which is likely the central focus of the picture.
 ```
 
@@ -299,6 +300,8 @@ See the [API documentation](./docs/api.md) for all endpoints.
 - [AI Studio](https://github.com/MindWorkAI/AI-Studio)
 - [Sidellama](https://github.com/gyopak/sidellama) (browser-based LLM client)
 - [LLMStack](https://github.com/trypromptly/LLMStack) (No-code multi-agent framework to build LLM agents and workflows)
+- [BoltAI for Mac](https://boltai.com) (AI Chat Client for Mac)
+- [Harbor](https://github.com/av/harbor) (Containerized LLM Toolkit with Ollama as default backend)
 
 ### Terminal
 
@@ -337,6 +340,7 @@ See the [API documentation](./docs/api.md) for all endpoints.
 ### Libraries
 
 - [LangChain](https://python.langchain.com/docs/integrations/llms/ollama) and [LangChain.js](https://js.langchain.com/docs/modules/model_io/models/llms/integrations/ollama) with [example](https://js.langchain.com/docs/use_cases/question_answering/local_retrieval_qa)
+- [Firebase Genkit](https://firebase.google.com/docs/genkit/plugins/ollama)
 - [LangChainGo](https://github.com/tmc/langchaingo/) with [example](https://github.com/tmc/langchaingo/tree/main/examples/ollama-completion-example)
 - [LangChain4j](https://github.com/langchain4j/langchain4j) with [example](https://github.com/langchain4j/langchain4j-examples/tree/main/ollama-examples/src/main/java)
 - [LangChainRust](https://github.com/Abraxas-365/langchain-rust) with [example](https://github.com/Abraxas-365/langchain-rust/blob/main/examples/llm_ollama.rs)

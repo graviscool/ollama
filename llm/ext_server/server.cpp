@@ -44,6 +44,7 @@
 #include <errhandlingapi.h>
 #endif
 
+#include <algorithm>
 #include <cstddef>
 #include <thread>
 #include <chrono>
@@ -402,7 +403,9 @@ struct llama_server_context
             }
         }
 
-        std::tie(model, ctx) = llama_init_from_gpt_params(params);
+        auto init_result = llama_init_from_gpt_params(params);
+        model = init_result.model;
+        ctx = init_result.context;
         if (model == nullptr)
         {
             LOG_ERROR("unable to load model", {{"model", params.model}});
@@ -1220,7 +1223,9 @@ struct llama_server_context
 
                 res.result_json = json
                 {
+                    {"id", res.id},
                     {"embedding", std::vector<float>(embd, embd + n_embd)},
+                    {"timings",             slot.get_formated_timings()},
                 };
             }
         }
@@ -2419,7 +2424,10 @@ static void server_params_parse(int argc, char **argv, server_params &sparams, g
                 invalid_param = true;
                 break;
             }
-            params.lora_adapter.emplace_back(argv[i], 1.0f);
+            params.lora_adapters.push_back({
+                std::string(argv[i]),
+                1.0,
+            });
             params.use_mmap = false;
         }
         else if (arg == "--lora-scaled")
@@ -2435,7 +2443,10 @@ static void server_params_parse(int argc, char **argv, server_params &sparams, g
                 invalid_param = true;
                 break;
             }
-            params.lora_adapter.emplace_back(lora_adapter, std::stof(argv[i]));
+            params.lora_adapters.push_back({
+                lora_adapter,
+                std::stof(argv[i])
+            });
             params.use_mmap = false;
         }
         else if (arg == "-v" || arg == "--verbose")
@@ -3202,12 +3213,20 @@ int main(int argc, char **argv) {
                     }
 
                     responses = result.result_json.value("results", std::vector<json>{result.result_json});
+                    std::sort(responses.begin(), responses.end(), [](const json& a, const json& b) {
+                        return a["id"] < b["id"];
+                    });
+
                     json embeddings = json::array();
+
+                    int prompt_n = 0;
                     for (auto & elem : responses) {
                         embeddings.push_back(elem.at("embedding"));
+                        prompt_n += elem.at("timings").at("prompt_n").get<int>();
                     }
+
                     // send the result
-                    json embedding_res = json{{"embedding", embeddings}};
+                    json embedding_res = json{{"embedding", embeddings}, {"prompt_n", prompt_n}};
                     return res.set_content(embedding_res.dump(), "application/json; charset=utf-8");
                 }
             });
